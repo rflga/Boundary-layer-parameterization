@@ -1,4 +1,5 @@
 import matplotlib.pyplot as plt
+from sklearn.metrics import r2_score
 import xarray as xr
 import numpy as np
 import torch
@@ -27,6 +28,10 @@ Outputs_znorm    = xr.open_dataset('Outputs_znorm.nc')
 subgrid_wu_znorm = Outputs_znorm.subgrid_wu_znorm
 subgrid_wv_znorm = Outputs_znorm.subgrid_wv_znorm
 
+z = subgrid_wu_znorm.normalized_z
+nz = len(z)
+
+
 
 
 # --------------- 1. Normalize inputs / outputs ---------------
@@ -40,13 +45,18 @@ Normalized_subConcat = xr.concat((Normalized_subWU, Normalized_subWV), dim='norm
 
 INPUTS = [Normalized_U, Normalized_V,  Normalized_tke]
 nVariables = len(INPUTS)
-nFeatures  = nVariables * new_nz
+nFeatures  = nVariables * nz
 Normalized_inputs = np.nan*np.zeros([nFeatures, nSample])
 for i in range(nVariables):
-    Normalized_inputs[i*new_nz: (i+1)*new_nz] = INPUTS[i]
+    Normalized_inputs[i*nz: (i+1)*nz] = INPUTS[i]
 
 Normalized_inputs_DA = xr.DataArray(Normalized_inputs, dims=['input_feature', 'sample'], coords=[np.arange(nFeatures), Normalized_U.sample])
 # ------------------------------------------------------------
+
+
+
+
+
 
 
 
@@ -77,8 +87,6 @@ VARS = [subgrid_wu_znorm, subgrid_wv_znorm]
 GS_out = gridspec.GridSpec(1,2, wspace=0.5)
 GS_in1 = gridspec.GridSpecFromSubplotSpec(2, 2, subplot_spec=GS_out[0], wspace=0.03, hspace=0.5)
 GS_in2 = gridspec.GridSpecFromSubplotSpec(2, 2, subplot_spec=GS_out[1], wspace=0.03, hspace=0.5)
-
-z = subgrid_wu_znorm.normalized_z
 
 for fld_lab, GS in zip(['HF', 'Ug'], [GS_in1, GS_in2]):
   for c1, (var, Norm_var, tit) in enumerate(zip(VARS, [Normalized_subWU, Normalized_subWV], ['WU', 'WV'])):
@@ -140,6 +148,8 @@ for fld_lab, GS in zip(['HF', 'Ug'], [GS_in1, GS_in2]):
 
 fig.savefig("Fig1.png", dpi=500)
 # ------------------------------------------------------------
+
+
 
 
 
@@ -224,6 +234,239 @@ for epoch in range(n_epochs):
         val_losses.append(val_loss.item())
 # ------------------------------------------------------------
 
+
+
+
+
+
+
+
+
+
+# --------------- 4. Plot predicted vs truth - With density plots (Figure 2) ---------------
+def plot_density(pred, true, ax=None, cmap='viridis', gridsize=200):
+    minval = min(pred.min(), true.min())
+    maxval = max(pred.max(), true.max())
+    if ax is not None:
+        hb = ax.hexbin(pred, true, gridsize=gridsize,
+               cmap=cmap, mincnt=1, norm=LogNorm(vmin=1, vmax=500))
+        
+        ax.plot([minval, maxval], [minval, maxval], 'k--', lw=1)
+        ax.set_xlabel('Predicted Flux ($m^2/s^2$)', fontsize=12)
+        ax.set_ylabel('True Flux ($m^2/s^2$)', fontsize=12)
+        ax.set_title(f'Predicted vs True Fluxes', fontsize=14)
+        cbar = fig.colorbar(hb, ax=ax, shrink=0.7) 
+        cbar.set_label('Counts', rotation=270, labelpad=10)
+
+
+model.eval()
+# True fluxes
+subgrid_wu_test = subgrid_wu_znorm[:, test_indices]
+subgrid_wv_test = subgrid_wv_znorm[:, test_indices]
+
+subgrid_wu_test_atmos = subgrid_wu_test.where(subgrid_wu_test.sample.str.contains('ATMOS'), drop=True)
+subgrid_wv_test_atmos = subgrid_wv_test.where(subgrid_wv_test.sample.str.contains('ATMOS'), drop=True)
+subgrid_wu_test_ocean = subgrid_wu_test.where(subgrid_wu_test.sample.str.contains('OCEAN'), drop=True)
+subgrid_wv_test_ocean = subgrid_wv_test.where(subgrid_wv_test.sample.str.contains('OCEAN'), drop=True)
+
+# ANN-Predicted fluxes
+predicted_fluxes = model(X_test)
+predicted_wu = predicted_fluxes[:, :nz].detach().numpy()
+predicted_wv = predicted_fluxes[:, nz:].detach().numpy()
+
+predicted_wu = xr.DataArray(predicted_wu, dims=['sample', 'normalized_z'], coords=[subgrid_wu[:, test_indices].sample, z])
+predicted_wv = xr.DataArray(predicted_wv, dims=['sample', 'normalized_z'], coords=[subgrid_wu[:, test_indices].sample, z])
+
+predicted_wu_atmos = predicted_wu.where(predicted_wu.sample.str.contains('ATMOS'), drop=True)
+predicted_wv_atmos = predicted_wv.where(predicted_wv.sample.str.contains('ATMOS'), drop=True)
+predicted_wu_ocean = predicted_wu.where(predicted_wu.sample.str.contains('OCEAN'), drop=True)
+predicted_wv_ocean = predicted_wv.where(predicted_wv.sample.str.contains('OCEAN'), drop=True)
+
+# Un-normalize the prediction
+unnorm_predicted_wu_atmos = predicted_wu_atmos * subgrid_wu_znorm[:, test_indices].where(subgrid_wu_znorm.sample.str.contains('ATMOS'), drop=True)[0]
+unnorm_predicted_wv_atmos = predicted_wv_atmos * subgrid_wv_znorm[:, test_indices].where(subgrid_wv_znorm.sample.str.contains('ATMOS'), drop=True)[0]
+unnorm_predicted_wu_ocean = predicted_wu_ocean * subgrid_wu_znorm[:, test_indices].where(subgrid_wu_znorm.sample.str.contains('OCEAN'), drop=True)[0]
+unnorm_predicted_wv_ocean = predicted_wv_ocean * subgrid_wv_znorm[:, test_indices].where(subgrid_wv_znorm.sample.str.contains('OCEAN'), drop=True)[0]
+
+# 1D predicted and truth for density plot and R2
+unorm_predicted_atmos_1d = np.append(unnorm_predicted_wu_atmos.T.values.flatten(), unnorm_predicted_wv_atmos.T.values.flatten())
+unorm_predicted_ocean_1d = np.append(unnorm_predicted_wu_ocean.T.values.flatten(), unnorm_predicted_wv_ocean.T.values.flatten())
+
+unnorm_predicted_wu_1d = np.append(unnorm_predicted_wu_atmos.T.values.flatten(), unnorm_predicted_wu_ocean.T.values.flatten())
+unnorm_predicted_wv_1d = np.append(unnorm_predicted_wv_atmos.T.values.flatten(), unnorm_predicted_wv_ocean.T.values.flatten())
+
+subgrid_test_atmos_1d = np.append(subgrid_wu_test_atmos.values.flatten(), subgrid_wv_test_atmos.values.flatten())
+subgrid_test_ocean_1d = np.append(subgrid_wu_test_ocean.values.flatten(), subgrid_wv_test_ocean.values.flatten())
+
+r2_atm = r2_score(subgrid_test_atmos_1d, unorm_predicted_atmos_1d)
+r2_oce = r2_score(subgrid_test_ocean_1d, unorm_predicted_ocean_1d)
+
+print('R2 in Atmos: ', r2_atm)
+print('R2 in Ocean: ', r2_oce)
+
+# Plot the figure
+GS_out = gridspec.GridSpec(1,2, wspace=0.5)
+GS_in1 = gridspec.GridSpecFromSubplotSpec(2, 2, subplot_spec=GS_out[0], wspace=0.03, hspace=0.4)
+GS_in2 = gridspec.GridSpecFromSubplotSpec(2, 2, subplot_spec=GS_out[1], wspace=0.03, hspace=0.4)
+
+fig1 = plt.figure(figsize=(10,6))
+ax1, ax2, ax3, ax4 = fig1.add_subplot(GS_in1[0,0]), fig1.add_subplot(GS_in1[0,1]), fig1.add_subplot(GS_in2[0,0]), fig1.add_subplot(GS_in2[0,1])
+ax5, ax6 = fig1.add_subplot(GS_in1[1,:]), fig1.add_subplot(GS_in2[1,:])
+
+plot_density(unorm_predicted_atmos_1d, subgrid_test_atmos_1d, ax=ax5)
+plot_density(unorm_predicted_ocean_1d, subgrid_test_ocean_1d, ax=ax6)
+
+# Atmos w'u'
+ax1.plot(unnorm_predicted_wu_atmos.mean(dim='sample'), z, label='Prediction', color='blue')
+ax1.plot(subgrid_wu_test_atmos.mean(dim='sample'), z, label='Truth', color='orange')
+ax1.fill_betweenx(z, unnorm_predicted_wu_atmos.mean(dim='sample')-unnorm_predicted_wu_atmos.std(dim='sample'), unnorm_predicted_wu_atmos.mean(dim='sample')+unnorm_predicted_wu_atmos.std(dim='sample'), color='blue', alpha=0.1)
+ax1.fill_betweenx(z, subgrid_wu_test_atmos.mean(dim='sample') - subgrid_wu_test_atmos.std(dim='sample'), subgrid_wu_test_atmos.mean(dim='sample') + subgrid_wu_test_atmos.std(dim='sample'), color='orange', alpha=0.1)
+
+# Atmos v'w'
+ax2.plot(unnorm_predicted_wv_atmos.mean(dim='sample'), z, label='Prediction', color='blue')
+ax2.plot(subgrid_wv_test_atmos.mean(dim='sample'), z, label='Truth', color='orange')
+ax2.fill_betweenx(z, unnorm_predicted_wv_atmos.mean(dim='sample')-unnorm_predicted_wv_atmos.std(dim='sample'), unnorm_predicted_wv_atmos.mean(dim='sample')+unnorm_predicted_wv_atmos.std(dim='sample'), color='blue', alpha=0.1)
+ax2.fill_betweenx(z, subgrid_wv_test_atmos.mean(dim='sample') - subgrid_wv_test_atmos.std(dim='sample'), subgrid_wv_test_atmos.mean(dim='sample') + subgrid_wv_test_atmos.std(dim='sample'), color='orange', alpha=0.1)
+
+# Ocean w'u'
+ax3.plot(unnorm_predicted_wu_ocean.mean(dim='sample'), z, label='Prediction', color='blue')
+ax3.plot(subgrid_wu_test_ocean.mean(dim='sample'), z, label='Truth', color='orange')
+ax3.fill_betweenx(z, unnorm_predicted_wu_ocean.mean(dim='sample')-unnorm_predicted_wu_ocean.std(dim='sample'), unnorm_predicted_wu_ocean.mean(dim='sample')+unnorm_predicted_wu_ocean.std(dim='sample'), color='blue', alpha=0.1)
+ax3.fill_betweenx(z, subgrid_wu_test_ocean.mean(dim='sample') - subgrid_wu_test_ocean.std(dim='sample'), subgrid_wu_test_ocean.mean(dim='sample') + subgrid_wu_test_ocean.std(dim='sample'), color='orange', alpha=0.1)
+
+# Ocean v'w'
+ax4.plot(unnorm_predicted_wv_ocean.mean(dim='sample'), z, label='Prediction', color='blue')
+ax4.plot(subgrid_wv_test_ocean.mean(dim='sample'), z, label='Truth', color='orange')
+ax4.fill_betweenx(z, unnorm_predicted_wv_ocean.mean(dim='sample')-unnorm_predicted_wv_ocean.std(dim='sample'), unnorm_predicted_wv_ocean.mean(dim='sample')+unnorm_predicted_wv_ocean.std(dim='sample'), color='blue', alpha=0.1)
+ax4.fill_betweenx(z, subgrid_wv_test_ocean.mean(dim='sample') - subgrid_wv_test_ocean.std(dim='sample'), subgrid_wv_test_ocean.mean(dim='sample') + subgrid_wv_test_ocean.std(dim='sample'), color='orange', alpha=0.1)
+
+# Legends
+ax1.legend()
+ax2.legend()
+ax3.legend(loc='upper left')
+ax4.legend(loc='upper left')
+
+# Ticks
+ax2.set_yticks([])
+ax3.set_xticks(ax3.get_xticks()[::2])
+ax4.set_xticks(ax4.get_xticks()[2::2])
+ax4.set_yticks
+
+# Titles and labels
+ax1.set_title('Atmospheric $\overline{u\'w\'}$')
+ax2.set_title('Atmospheric $\overline{v\'w\'}$')
+ax3.set_title('Oceanic $\overline{u\'w\'}$')
+ax4.set_title('Oceanic $\overline{v\'w\'}$')
+ax1.set_xlabel('Momentum flux ($m^2/s^{-2}$)', fontsize=9)
+ax2.set_xlabel('Momentum flux ($m^2/s^{-2}$)', fontsize=9)
+ax3.set_xlabel('Momentum flux ($m^2/s^{-2}$)', fontsize=9)
+ax4.set_xlabel('Momentum flux ($m^2/s^{-2}$)', fontsize=9)
+ax1.set_ylabel('Altitude (m)')
+ax3.set_ylabel('Depth (m)')
+
+fig1.savefig('Prez_fig2.png', dpi=500)
+# ------------------------------------------------------------
+
+
+
+
+
+
+
+
+
+
+# --------------- 5. Plot upgradient fluxes (Figure 3) ---------------
+ucoarse_test  = ucoarse_znorm[:, test_indices]
+vcoarse_test  = vcoarse_znorm[:, test_indices]
+
+ucoarse_test_atm  = ucoarse_test.where(ucoarse_test.sample.str.contains('ATMOS'), drop=True)
+ucoarse_test_oce  = ucoarse_test.where(ucoarse_test.sample.str.contains('OCEAN'), drop=True)
+vcoarse_test_atm  = vcoarse_test.where(vcoarse_test.sample.str.contains('ATMOS'), drop=True)
+vcoarse_test_oce  = vcoarse_test.where(vcoarse_test.sample.str.contains('OCEAN'), drop=True)
+
+GS = gridspec.GridSpec(1,2, wspace=0.3)
+gs1 = gridspec.GridSpecFromSubplotSpec(1, 2, subplot_spec=GS[0], wspace=0)
+gs2 = gridspec.GridSpecFromSubplotSpec(1, 2, subplot_spec=GS[1], wspace=0)
+
+fig = plt.figure(figsize=(13,4))
+ax1, ax2 = fig.add_subplot(gs1[0]), fig.add_subplot(gs1[1])
+ax3, ax4 = fig.add_subplot(gs2[0]), fig.add_subplot(gs2[1])
+
+for i, axes in zip([0,1], [[ax1,ax2], [ax3,ax4]]):
+    ax_u, ax_suw = axes[0], axes[1]
+    
+    if i==0:
+        # Atmospheric example
+        sample = 3348
+        test_sample = np.where(unnorm_predicted_wu_atmos.sample.str.contains(f'i_sample={str(sample)}'))[0][0]
+
+        suw_s      = unnorm_predicted_wv_atmos[test_sample].values
+        suw_s_true = subgrid_wv_test_atmos[:, test_sample].values
+
+        us = vcoarse_test_atm[:, test_sample].values
+    
+    if i==1:
+        # Oceanic example
+        sample = 6380
+        test_sample = np.where(unnorm_predicted_wu_ocean.sample.str.contains(f'i_sample={str(sample)}'))[0][0]
+
+        suw_s      = unnorm_predicted_wv_ocean[test_sample].values
+        suw_s_true = subgrid_wv_test_ocean[:, test_sample].values
+        
+        us = vcoarse_znorm[:, sample].values
+
+    ax_suw.axvline(0, linestyle='--', color='black', linewidth=0.5)
+    ax_suw.plot(suw_s_true, z, linewidth=2.5, color='orange',    label='True flux')
+    ax_suw.plot(suw_s,      z, linewidth=2.5, color='royalblue', label='Predicted flux')
+    
+    ax_u.plot(us, z, linewidth=2.5, color='brown', label='u profile')
+
+    # Compute RMSE
+    rmse = np.sqrt(np.mean((suw_s_true - suw_s) ** 2))
+    print('RMSE:', rmse)
+
+alt1, alt2 = 0.43, 0.70
+ax1.axhspan(alt1, alt2, color='gray', alpha=0.3, label='Upgradient flux zone') 
+ax2.axhspan(alt1, alt2, color='gray', alpha=0.3)
+
+alt3, alt4 = -0.34, -0.73
+ax3.axhspan(alt3, alt4, color='gray', alpha=0.3, label='Upgradient flux zone') 
+ax4.axhspan(alt3, alt4, color='gray', alpha=0.3)
+
+# Legend
+ax1.legend(loc='upper left', fontsize=10)
+ax2.legend(loc='upper left', fontsize=10)
+ax3.legend(loc='lower left', fontsize=10)
+ax4.legend(loc='lower left', fontsize=10)
+
+
+# Ticks
+ax2.set_yticks([])
+ax4.set_yticks([])
+ax1.tick_params(axis='both', labelsize=11)
+ax2.tick_params(axis='both', labelsize=11)
+ax3.tick_params(axis='both', labelsize=11)
+ax4.tick_params(axis='both', labelsize=11)
+ax1.set_xticks([8.0, 8.4])
+ax2.set_xticks(ax2.get_xticks()[1::2])
+ax3.set_xticks([0.000, -0.006])
+
+# Titles and Labels
+ax1.set_ylabel('$z/z_i$', fontsize=15)
+ax1.set_xlabel('Wind speed $(m/s)$', fontsize=10)
+ax1.set_title('Zonal Wind $u$', fontsize=12)
+
+ax3.set_ylabel('$z/z_i$', fontsize=15)
+ax3.set_xlabel('Current $(m/s)$', fontsize=10)
+ax3.set_title('Zonal Current $u$', fontsize=12)
+
+offset_text = ax4.xaxis.get_offset_text()
+offset_text.set_x(1.1)     
+offset_text.set_y(0.5) 
+
+fig.savefig('Fig3.png', dpi=500)
+# ------------------------------------------------------------
 
 
 
