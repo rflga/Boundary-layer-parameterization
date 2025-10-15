@@ -11,11 +11,14 @@ from sklearn.model_selection import train_test_split
 import matplotlib.colors as clrs
 import matplotlib.cm as cm
 import os
+import random
 
 # Atmos and Ocean datasets
 nSample_atm = 5920
 nSample_oce = 4004
 nSample = nSample_atm + nSample_oce
+index_atmos = np.arange(nSample_atm)
+index_ocean = np.arange(nSample_atm, nSample)
 
 # Inputs - Normalized by zi
 Inputs_znorm  = xr.open_dataset('Inputs_znorm.nc')
@@ -474,4 +477,169 @@ fig.savefig('Fig3.png', dpi=500)
 
 
 
+
+# --------------- 6. Ocean data-limited regime augmented with atmospheric data (Figure 4) ---------------
+np.random.seed(42)
+
+nTrain = 100
+nTest  = 100
+nVal   = 100
+
+shuffled_index_atmos = np.random.permutation(index_atmos)
+
+nRS = 12    # Twelve ocean simulations
+nInit = 10  # 10 different initialization of weights for ANN
+
+rmse_oce_only = np.nan*np.zeros([nRS, nInit])
+rmse_oce_atmo = np.nan*np.zeros([nRS, nInit])
+
+# Train on one Ocean simu, test on the rest of ocean simus (+ atmos sometimes)
+for c_rs, simu in enumerate(Simu_list_oce):
+    # Training data
+    masked_data_simu  = Normalized_inputs_DA.sample.str.contains(simu)
+
+    # Create a mask that contains only ocean samples, but doesn't contain the simulation we are training on
+    masked_data_rest  = ~Normalized_inputs_DA.sample.str.contains(simu)
+    masked_data_ocean =  Normalized_inputs_DA.sample.str.contains('HF')
+    mask_testval      =  masked_data_rest & masked_data_ocean
+
+    indices_simu    = np.array([i for i, val in enumerate(masked_data_simu.values) if val])
+    indices_testval = np.array([i for i, val in enumerate(mask_testval.values) if val])
+
+    np.random.seed(0)
+    shuffled_index_ocean   = np.random.permutation(indices_simu)
+    shuffled_index_testval = np.random.permutation(indices_testval)
+
+    for train_settings in ['OCEAN_ONLY', 'OCEAN_ATMOS']:  #, 'OCEAN_MORE']:
+        if train_settings == 'OCEAN_ONLY':
+            # Only take 100 ocean samples from the simulation
+            train_indices = shuffled_index_ocean[:nTrain]
+            
+        if train_settings == 'OCEAN_ATMOS':
+            # Second we take the 100 ocean samples + 1000 random atmos
+            train_indices = np.append(shuffled_index_atmos[:1000], shuffled_index_ocean[:nTrain])
+
+        test_indices = shuffled_index_testval[:nTest]
+        val_indices  = shuffled_index_testval[nTest:nTest+nVal]
+
+        X_train = torch.tensor(Normalized_inputs_DA.T[train_indices].values,  dtype=torch.float32)
+        X_test  = torch.tensor( Normalized_inputs_DA.T[test_indices].values,  dtype=torch.float32)
+        X_val   = torch.tensor(  Normalized_inputs_DA.T[val_indices].values,  dtype=torch.float32)
+
+        y_train = torch.tensor(Normalized_subConcat.T[train_indices].values,  dtype=torch.float32)
+        y_test  = torch.tensor( Normalized_subConcat.T[test_indices].values,  dtype=torch.float32)
+        y_val   = torch.tensor(  Normalized_subConcat.T[val_indices].values,  dtype=torch.float32)
+
+        nNeurons = 128
+        batch_size = 200
+        n_epochs = 200
+        learning_rate = 0.0001
+        drop = 0.2
+        weight_decay = 1e-4
+
+        nfeat = Normalized_inputs_DA.shape[0]
+        nout  = Normalized_subConcat.shape[0]
+
+        for init in range(nInit):
+            model = nn.Sequential(
+                nn.Linear(nfeat, nNeurons),
+                nn.ReLU(),
+                nn.Dropout(p=drop),
+                nn.Linear(nNeurons, nNeurons),
+                nn.ReLU(),
+                nn.Dropout(p=drop),
+                nn.Linear(nNeurons, nNeurons),
+                nn.ReLU(),
+                nn.Dropout(p=drop),
+                nn.Linear(nNeurons, nout))
+
+            Loss = nn.MSELoss()
+            optimizer = optim.Adam(model.parameters(), lr = learning_rate, weight_decay=weight_decay)
+    
+            train_losses = []
+            val_losses = []
+    
+            for epoch in range(n_epochs):
+                model.train()
+                train_loss = 0.0
+                for i in range(0, X_train.shape[0], batch_size):
+                    Xbatch = X_train[i:i+batch_size]
+                    ybatch = y_train[i:i+batch_size]
+    
+                    optimizer.zero_grad()
+                    y_pred = model(Xbatch)
+    
+                    loss = Loss(y_pred, ybatch)
+
+                    loss.backward()
+                    optimizer.step()
+
+                    train_loss += loss.item() * Xbatch.size(0)
+
+                # Average losses
+                train_loss /= X_train.shape[0]
+                train_losses.append(train_loss)
+                
+                if X_val is not None:
+                    # Validation step
+                    model.eval()
+                    val_loss = 0.0
+                    with torch.no_grad():
+                        y_val_pred = model(X_val)
+                        val_loss = Loss(y_val_pred, y_val)
+                        val_losses.append(val_loss.item())
+
+            model.eval()
+            y_pred = model(X_test)
+            rmse = root_mean_squared_error(y_test.detach().numpy().flatten(), y_pred.detach().numpy().flatten())
+
+            if train_settings == 'OCEAN_ONLY':
+                rmse_oce_only[c_rs, init] = rmse
+            if train_settings == 'OCEAN_ATMOS':
+                rmse_oce_atmo[c_rs, init] = rmse
+
+rmse_oce_only_da = xr.DataArray(rmse_oce_only, dims=['random_seeds', 'NN_init'])
+rmse_oce_atmo_da = xr.DataArray(rmse_oce_atmo, dims=['random_seeds', 'NN_init'])
+
+# Plot the figure
+mean_rmse_oce_only = rmse_oce_only_da.mean(dim='NN_init')
+mean_rmse_oce_atmo = rmse_oce_atmo_da.mean(dim='NN_init')
+std_rmse_oce_only  = rmse_oce_only_da.std(dim='NN_init')
+std_rmse_oce_atmo  = rmse_oce_atmo_da.std(dim='NN_init')
+
+fig = plt.figure(figsize=(12, 5))
+
+X  = np.arange(nRS)
+dx = 0.03
+
+for x in X:
+    plt.axvline(x, linestyle='--', color='black', linewidth=0.1)
+
+plt.errorbar(X-dx, mean_rmse_oce_only, xerr=0, yerr=std_rmse_oce_only, fmt='none', capsize=5, color='black', zorder=1)
+plt.errorbar(X+dx, mean_rmse_oce_atmo, xerr=0, yerr=std_rmse_oce_atmo, fmt='none', capsize=5, color='black', zorder=1)
+
+plt.scatter(X-dx, mean_rmse_oce_only, marker='d', s=70, edgecolor='black', color='cyan',  label='Train on 100 Ocean samples')
+plt.scatter(X+dx, mean_rmse_oce_atmo, marker='d', s=70, edgecolor='black', color='green', label='Train on 100 Ocean + 1000 Atmos. samples')
+
+offset_yp = np.array([0.003, 0.004, 0.005, 0.004, 0.004, 0.004, 0.003, 0.004, 0.005, 0.004, 0.004, 0.005])
+offset_ym = np.array([0.005, 0.005, 0.005, 0.006, 0.006, 0.006, 0.004, 0.005, 0.006, 0.005, 0.005, 0.009])
+
+for xi, y, offp in zip(X, mean_rmse_oce_only, offset_yp):
+    plt.text(xi-dx, y+offp, f"{y:.3f}", ha='center', va='bottom', fontsize=10)
+for xi, y, offm in zip(X, mean_rmse_oce_atmo, offset_ym):  
+    plt.text(xi+dx, y-offm, f"{y:.3f}", ha='center', va='top', fontsize=10)
+
+plt.legend(loc='upper right')
+
+plt.yticks([0.15, 0.17, 0.19, 0.21, 0.23])
+plt.xticks(ticks=X, labels=Labels_oce, fontsize=14)
+plt.tick_params(axis='y', labelsize=12)
+
+plt.title('Effect of including atmospheric data on ocean prediction', fontsize=14)
+plt.ylabel('Normalized RMSE', fontsize=14)
+plt.xlabel('Ocean simulation sampled for training', fontsize=12)
+plt.ylim(0.145, 0.235)
+
+fig.savefig('Fig4.png', dpi=500)
+# ------------------------------------------------------------
 
