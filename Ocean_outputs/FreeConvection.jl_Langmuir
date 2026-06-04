@@ -1,0 +1,308 @@
+using Random
+using Printf
+using CairoMakie
+using CUDA
+using Oceananigans
+using Oceananigans.Units: minute, minutes, hour, day
+using Oceanostics
+using Oceananigans.Grids: Face, Center
+using Oceananigans.Advection
+using Oceananigans
+using Oceananigans.Fields: Field
+using Oceananigans.AbstractOperations: Average
+using NCDatasets
+using SeawaterPolynomials.TEOS10: TEOS10EquationOfState
+using Oceananigans.Grids: znodes
+
+#include("../LESbrary_scripts/first_through_third_order.jl")
+#include("../LESbrary_scripts/subfilter_fluxes.jl")
+#include("../LESbrary_scripts/turbulent_kinetic_energy_budget.jl")
+
+
+using Oceananigans.Fields: ZeroField
+import Oceananigans.Architectures: architecture
+#check if we need to activate below
+architecture(::ZeroField) = GPU()
+
+
+# ---------- FUNCTIONS USED IN THE SCRIPT ----------
+"""
+    initial_temperature(x, y, z)
+Returns a three-layer initial temperature distribution. The average temperature varies in z
+and is augmented by three-dimensional, surface-concentrated random noise.
+"""
+function initial_temperature(x, y, z)
+
+    noise = 1e-6 * Ξ(z) * dθdz_surface_layer * grid.Lz
+
+    if z_transition < z <= 0
+        return θ_surface + dθdz_surface_layer * z + noise
+
+    elseif z_deep < z <= z_transition
+        return θ_transition + dθdz_thermocline * (z - z_transition) + noise
+
+    else
+        return θ_deep + dθdz_deep * (z - z_deep) + noise
+
+    end
+end
+
+
+
+# ---------- Domain + Parameters to modify ----------
+Nx = Ny = 256     # number of points in each of horizontal directions
+Nz = 128          # number of points in the vertical direction
+
+Lx = Ly = 512     # (m) domain horizontal extents
+Lz = 256          # (m) domain depth
+
+
+grid = RectilinearGrid(GPU(), size = (Nx, Nx, Nz),
+                          x = (0, Lx),
+                          y = (0, Ly),
+                          z = (-Lz,0))
+
+simulation_length = 4day
+
+# Coriolis parameter 
+fcor = 3e-5
+
+# Boundary conditions
+Qʰ  = 50        # W m⁻², surface _heat_ flux
+u₁₀ = 5        # m s⁻¹, average wind velocity 10 meters above the ocean
+
+simu_name = "U$(u₁₀)HF$(Qʰ)fcor$(fcor)_LM"  # LM = Langmuir
+
+
+
+# ---------- Boundary conditions ----------
+evaporation_rate = 1e-7     # Mass-specific evaporation rate [m s⁻¹]
+f = 1e-4                    # Coriolis parameter
+α = 2e-4                    # Thermal expansion coefficient
+β = 8e-4                    # Haline contraction coefficient
+S = 35                      # Salinity
+g = 9.81                    # Gravitation
+
+# Temperature 
+ρₒ = 1026.0            # kg m⁻³, average density at the surface of the world ocean
+cᴾ = 3991.0            # J K⁻¹ kg⁻¹, typical heat capacity for seawater
+Qᵀ = Qʰ / (ρₒ * cᴾ)    # K m s⁻¹, surface _temperature_ flux
+
+θ_surface = 20  # Initial surface temperature (C)
+
+surface_layer_depth = 48
+thermocline_width = 24
+
+N²_surface_layer = 1e-6      # surface-layer-buoyancy-gradient, in /s2 (~Brunt Vaisala)
+N²_thermocline = 1e-5        # thermocline-buoyancy-gradient
+N²_deep = 4e-6               # deep-buoyancy-gradient
+dθdz_surface_layer = N²_surface_layer / (α * g)
+dθdz_thermocline   = N²_thermocline   / (α * g)
+dθdz_deep          = N²_deep          / (α * g)
+
+zC = znodes(grid, Center())
+zF = znodes(grid, Face())
+
+k_transition = searchsortedfirst(zC, -surface_layer_depth)
+k_deep = searchsortedfirst(zC, -(surface_layer_depth + thermocline_width))
+
+z_transition = zC[k_transition]
+z_deep = zC[k_deep]
+
+θ_transition = θ_surface + z_transition * dθdz_surface_layer
+θ_deep = θ_transition + (z_deep - z_transition) * dθdz_thermocline
+
+#dTdz = 0.01 # K m⁻¹
+#dTdz = 0.02
+
+
+# --> For Langmuir circulation
+g = Oceananigans.defaults.gravitational_acceleration
+
+amplitude = 0.8 # m
+wavelength = 60  # m
+wavenumber = 2π / wavelength # m⁻¹
+frequency = sqrt(g * wavenumber) # s⁻¹
+
+# The vertical scale over which the Stokes drift of a monochromatic surface wave
+# decays away from the surface is `1/2wavenumber`, or
+const vertical_scale = wavelength / 4π
+
+# Stokes drift velocity at the surface
+const Uˢ = amplitude^2 * wavenumber * frequency # m s⁻¹
+
+uˢ(z) = Uˢ * exp(z / vertical_scale)
+
+∂z_uˢ(z, t) = 1 / vertical_scale * Uˢ * exp(z / vertical_scale)
+
+ 
+
+
+
+# Momentum
+cᴰ  = 2.5e-3                           # dimensionless drag coefficient
+ρₐ  = 1.225                            # kg m⁻³, average density of air at sea-level
+Qᵘ = - ρₐ / ρₒ * cᴰ * u₁₀ * abs(u₁₀)   # m² s⁻²
+
+
+
+equation_of_state = TEOS10EquationOfState(reference_density=ρₒ)
+buoyancy = SeawaterBuoyancy(; equation_of_state)
+
+
+
+# ----- Set the BCs -----
+#T_bcs = FieldBoundaryConditions(top    = FluxBoundaryCondition(Qᵀ),
+#                                bottom = GradientBoundaryCondition(dTdz))
+T_bcs = FieldBoundaryConditions(top = FluxBoundaryCondition(Qᵀ),  
+				bottom = GradientBoundaryCondition(dθdz_deep))
+
+
+u_bcs = FieldBoundaryConditions(top = FluxBoundaryCondition(Qᵘ))
+
+@inline Qˢ(x, y, t, S, evaporation_rate) = - evaporation_rate * S # [salinity unit] m s⁻¹
+
+evaporation_bc = FluxBoundaryCondition(Qˢ, field_dependencies=:S, parameters=evaporation_rate)
+S_bcs = FieldBoundaryConditions(top=evaporation_bc)
+
+
+#model = NonhydrostaticModel(grid;
+#    buoyancy = buoyancy,
+#    advection = WENO(order=5),
+#    timestepper = :RungeKutta3,
+#    tracers = (:T, :S),
+#    coriolis = FPlane(f=fcor),
+#    closure = AnisotropicMinimumDissipation(),
+#    boundary_conditions = (u=u_bcs, T=T_bcs, S=S_bcs)
+#)
+
+# Modify with Stokes drift
+model = NonhydrostaticModel(grid;
+    buoyancy = buoyancy,
+    advection = WENO(order=5),
+    timestepper = :RungeKutta3,
+    tracers = (:T, :S),
+    coriolis = FPlane(f=fcor),
+    stokes_drift = UniformStokesDrift(∂z_uˢ=∂z_uˢ),
+    closure = AnisotropicMinimumDissipation(),
+    boundary_conditions = (u=u_bcs, T=T_bcs, S=S_bcs)
+)
+
+
+# ---------- Initial conditions ----------
+# Random noise damped at top and bottom
+Ξ(z) = randn() * z / model.grid.Lz * (1 + z / model.grid.Lz) # noise
+Ξ(z) = rand() * exp(z / 8)
+
+
+# Temperature initial condition: a stable density gradient with random noise superposed.
+Tᵢ(x, y, z) = 20 + dTdz * z + dTdz * model.grid.Lz * 1e-6 * Ξ(z)
+
+# Velocity initial condition: random noise scaled by the friction velocity.
+uᵢ(x, y, z) = sqrt(abs(Qᵘ)) * 1e-3 * Ξ(z)
+
+# `set!` the `model` fields using functions or constants:
+#set!(model, u=uᵢ, w=uᵢ, T=Tᵢ, S=S)
+set!(model, u=uᵢ, w=uᵢ, T=initial_temperature, S=S)
+
+
+# ---------- Initialize the model ----------
+simulation = Simulation(model, Δt=1.0, stop_time = simulation_length)
+
+wizard = TimeStepWizard(cfl=1.0, max_change=1.1, max_Δt=1minute)
+simulation.callbacks[:wizard] = Callback(wizard, IterationInterval(10))
+
+# Print a progress message
+progress_message(sim) = @printf("Iteration: %04d, time: %s, Δt: %s, max(|w|) = %.1e ms⁻¹, wall time: %s\n",
+                                iteration(sim), prettytime(sim), prettytime(sim.Δt),
+                                maximum(abs, sim.model.velocities.w), prettytime(sim.run_wall_time))
+
+add_callback!(simulation, progress_message, IterationInterval(20))
+
+
+
+# ---------- Outputs ---------
+u = model.velocities.u
+v = model.velocities.v
+w = model.velocities.w
+T = model.tracers.T
+S = model.tracers.S
+
+ū = Field(Average(u, dims=(1,2)))
+v̄ = Field(Average(v, dims=(1,2)))
+w̄ = Field(Average(w, dims=(1,2)))
+T̄ = Field(Average(T, dims=(1,2)))
+S̄ = Field(Average(S, dims=(1,2)))
+
+u′ = u - ū
+v′ = v - v̄
+w′ = w - w̄
+T′ = T - T̄
+S′ = S - S̄
+
+uw = Field(Average(u′ * w′, dims=(1,2)))
+vw = Field(Average(v′ * w′, dims=(1,2)))
+wT = Field(Average(w′ * T′, dims=(1,2)))
+wS = Field(Average(w′ * S′, dims=(1,2)))
+
+# Subgrid
+νₑ = model.closure_fields.νₑ
+#κₑ = model.closure_fields.κₑ   # may be Field or NamedTuple
+
+κₑ = νₑ
+
+# Handle κₑ being per-tracer or single:
+κₑᵀ = κₑ isa NamedTuple ? getproperty(κₑ, :T) : κₑ
+κₑˢ = κₑ isa NamedTuple ? getproperty(κₑ, :S) : κₑ
+
+# Match staggered locations of ∂z(u), ∂z(v), ∂z(T/S) via @at:
+νₑ_fcf = @at (Face,   Center, Face) νₑ
+νₑ_cff = @at (Center, Face,   Face) νₑ
+
+κₑᵀ_ccf = @at (Center, Center, Face) κₑᵀ
+κₑˢ_ccf = @at (Center, Center, Face) κₑˢ
+
+τzu_sgs = Field(Average(-νₑ_fcf * ∂z(u), dims=(1, 2)))
+τzv_sgs = Field(Average(-νₑ_cff * ∂z(v), dims=(1, 2)))
+qzT_sgs = Field(Average(-κₑᵀ_ccf * ∂z(T), dims=(1, 2)))
+qzS_sgs = Field(Average(-κₑˢ_ccf * ∂z(S), dims=(1, 2)))
+
+
+statistics = Dict(
+    "u_mean" => ū,
+    "v_mean" => v̄,
+    "w_mean" => w̄,
+    "T_mean" => T̄,
+    "S_mean" => S̄,
+    "uw" => uw,
+    "vw" => vw,
+    "wT" => wT,
+    "wS" => wS,
+    "uw_sgs" => τzu_sgs,
+    "vw_sgs" => τzv_sgs,
+    "wT_sgs" => qzT_sgs 
+)
+
+eddy_viscosity = (; νₑ = model.closure_fields.νₑ)
+
+
+simulation.output_writers[:slices] =
+    NetCDFWriter(model, merge(model.velocities, model.tracers, eddy_viscosity),
+               filename = joinpath("/scratch/rf2774/Oceananigans/Anisotrop_NewIniStrat_outputs/", simu_name*".nc"),
+               schedule = TimeInterval(24hour),
+               overwrite_existing = true)
+
+
+
+simulation.output_writers[:stats] =
+    NetCDFWriter(model, statistics;
+        filename = joinpath("/scratch/rf2774/Oceananigans/Anisotrop_NewIniStrat_outputs/", "Statistics_" * simu_name * ".nc"),
+        schedule = TimeInterval(30minute),
+        overwrite_existing = true)
+
+
+run!(simulation)
+
+
+
+
